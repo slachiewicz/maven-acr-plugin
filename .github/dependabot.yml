@@ -1,0 +1,25 @@
+version: 2
+updates:
+- package-ecosystem: maven
+  directory: "/"
+  schedule:
+    interval: daily
+    time: "04:00"
+  open-pull-requests-limit: 10
+  ignore:
+  - dependency-name: org.codehaus.plexus:plexus-archiver
+    versions:
+    - 4.2.3
+    - 4.2.4
+  - dependency-name: org.apache.maven:maven-compat
+    versions:
+    - 3.6.3
+  - dependency-name: org.apache.maven:maven-artifact
+    versions:
+    - 3.6.3
+  - dependency-name: org.apache.maven:maven-core
+    versions:
+    - 3.6.3
+  - dependency-name: org.apache.maven:maven-plugin-api
+    versions:
+    - 3.6.3
