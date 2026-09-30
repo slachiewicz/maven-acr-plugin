@@ -18,11 +18,8 @@
  */
 package org.apache.maven.plugins.acr;
 
-import javax.inject.Inject;
-import javax.inject.Named;
-
-import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -30,24 +27,23 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.commons.io.input.XmlStreamReader;
-import org.apache.maven.archiver.MavenArchiveConfiguration;
-import org.apache.maven.archiver.MavenArchiver;
-import org.apache.maven.artifact.DependencyResolutionRequiredException;
-import org.apache.maven.execution.MavenSession;
-import org.apache.maven.plugin.AbstractMojo;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugins.annotations.LifecyclePhase;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.plugins.annotations.Parameter;
-import org.apache.maven.plugins.annotations.ResolutionScope;
-import org.apache.maven.project.MavenProject;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.di.Inject;
+import org.apache.maven.api.plugin.Log;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
+import org.apache.maven.api.plugin.annotations.Parameter;
+import org.apache.maven.api.services.ProjectManager;
+import org.apache.maven.shared.archiver.MavenArchiveConfiguration;
+import org.apache.maven.shared.archiver.MavenArchiver;
+import org.apache.maven.shared.archiver.MavenArchiverException;
 import org.apache.maven.shared.filtering.FilterWrapper;
 import org.apache.maven.shared.filtering.MavenFileFilter;
 import org.apache.maven.shared.filtering.MavenFilteringException;
 import org.apache.maven.shared.filtering.MavenResourcesExecution;
 import org.codehaus.plexus.archiver.ArchiverException;
 import org.codehaus.plexus.archiver.jar.JarArchiver;
-import org.codehaus.plexus.archiver.jar.ManifestException;
 import org.codehaus.plexus.archiver.util.DefaultFileSet;
 
 /**
@@ -56,12 +52,8 @@ import org.codehaus.plexus.archiver.util.DefaultFileSet;
  * @author <a href="pablo@anahata-it.com">Pablo Rodriguez</a>
  * @author <a href="snicoll@apache.org">Stephane Nicoll</a>
  */
-@Mojo(
-        name = "acr",
-        requiresDependencyResolution = ResolutionScope.RUNTIME,
-        threadSafe = true,
-        defaultPhase = LifecyclePhase.PACKAGE)
-public class AcrMojo extends AbstractMojo {
+@Mojo(name = "acr", defaultPhase = "package")
+public class AcrMojo implements org.apache.maven.api.plugin.Mojo {
 
     private static final String APP_CLIENT_XML = "META-INF/application-client.xml";
 
@@ -71,7 +63,7 @@ public class AcrMojo extends AbstractMojo {
      * The directory for the generated jar.
      */
     @Parameter(defaultValue = "${project.build.directory}", required = true, readonly = true)
-    private File basedir;
+    private Path basedir;
 
     /**
      * Directory that resources are copied to during the build.<br/>
@@ -79,7 +71,7 @@ public class AcrMojo extends AbstractMojo {
      * <code>maven.acr.outputDirectory</code>.
      */
     @Parameter(property = "maven.acr.outputDirectory", defaultValue = "${project.build.outputDirectory}")
-    private File outputDirectory;
+    private Path outputDirectory;
 
     /**
      * The name of the Application client JAR file to generate.
@@ -106,8 +98,8 @@ public class AcrMojo extends AbstractMojo {
     /**
      * The Maven project.
      */
-    @Parameter(defaultValue = "${project}", readonly = true, required = true)
-    private MavenProject project;
+    @Inject
+    private Project project;
 
     /**
      * The archive configuration to use. See <a href="https://maven.apache.org/shared/maven-archiver/index.html">Maven
@@ -145,8 +137,14 @@ public class AcrMojo extends AbstractMojo {
     @Parameter
     private List<String> filters;
 
-    @Parameter(defaultValue = "${session}", readonly = true, required = true)
-    private MavenSession session;
+    @Inject
+    private Session session;
+
+    @Inject
+    private ProjectManager projectManager;
+
+    @Inject
+    private Log log;
 
     /**
      * Timestamp for reproducible output archive entries, either formatted as ISO 8601
@@ -158,70 +156,54 @@ public class AcrMojo extends AbstractMojo {
     @Parameter(defaultValue = "${project.build.outputTimestamp}")
     private String outputTimestamp;
 
-    /**
-     * The Jar archiver.
-     */
-    private final JarArchiver jarArchiver;
-
-    private final MavenFileFilter mavenFileFilter;
-
     @Inject
-    public AcrMojo(JarArchiver jarArchiver, @Named("default") MavenFileFilter mavenFileFilter) {
-        this.jarArchiver = jarArchiver;
-        this.mavenFileFilter = mavenFileFilter;
-    }
+    private MavenFileFilter mavenFileFilter;
 
     @Override
-    public void execute() throws MojoExecutionException {
-        getLog().info("Building JavaEE Application client: " + jarName);
+    public void execute() throws MojoException {
+        log.info("Building JavaEE Application client: " + jarName);
 
-        File jarFile = new File(basedir, jarName + ".jar");
+        Path jarFile = basedir.resolve(jarName + ".jar");
 
         MavenArchiver archiver = new MavenArchiver();
 
-        archiver.setArchiver(jarArchiver);
+        archiver.setArchiver(new JarArchiver());
 
         archiver.setCreatedBy("Maven ACR Plugin", "org.apache.maven.plugins", "maven-acr-plugin");
 
-        archiver.setOutputFile(jarFile);
+        archiver.setOutputFile(jarFile.toFile());
 
         // configure for Reproducible Builds based on outputTimestamp value
         archiver.configureReproducibleBuild(outputTimestamp);
 
         try {
-            String[] mainJarExcludes = DEFAULT_EXCLUDES;
+            String[] mainJarExcludes = mainJarExcludes(excludes);
 
-            if (excludes != null && !excludes.isEmpty()) {
-                List<String> allExcludes = new ArrayList<>(excludes);
-                allExcludes.add(APP_CLIENT_XML);
-                mainJarExcludes = allExcludes.toArray(new String[0]);
-            }
-
-            if (outputDirectory.exists()) {
+            if (Files.exists(outputDirectory)) {
                 archiver.getArchiver()
-                        .addFileSet(DefaultFileSet.fileSet(outputDirectory)
+                        .addFileSet(DefaultFileSet.fileSet(outputDirectory.toFile())
                                 .prefixed("")
                                 .includeExclude(null, mainJarExcludes)
                                 .includeEmptyDirs(true));
             } else {
-                getLog().info("No content to add: " + outputDirectory + " does not exist");
+                log.info("No content to add: " + outputDirectory + " does not exist");
             }
 
-            File deploymentDescriptor = new File(outputDirectory, APP_CLIENT_XML);
+            Path deploymentDescriptor = outputDirectory.resolve(APP_CLIENT_XML);
 
-            if (deploymentDescriptor.exists()) {
+            if (Files.exists(deploymentDescriptor)) {
                 if (filterDeploymentDescriptor) {
-                    getLog().debug("Filtering deployment descriptor.");
+                    log.debug("Filtering deployment descriptor.");
                     MavenResourcesExecution mavenResourcesExecution = new MavenResourcesExecution();
                     mavenResourcesExecution.setEscapeString(escapeString);
                     List<FilterWrapper> filterWrappers = mavenFileFilter.getDefaultFilterWrappers(
-                            project, filters, escapeBackslashesInFilePath, this.session, mavenResourcesExecution);
+                            project, filters, escapeBackslashesInFilePath, session, mavenResourcesExecution);
 
                     // Create a temporary file that we can copy-and-filter
-                    File unfilteredDeploymentDescriptor = new File(outputDirectory, APP_CLIENT_XML + ".unfiltered");
+                    Path unfilteredDeploymentDescriptor = outputDirectory.resolve(APP_CLIENT_XML + ".unfiltered");
                     Files.copy(
-                            deploymentDescriptor.toPath(),
-                            unfilteredDeploymentDescriptor.toPath(),
+                            deploymentDescriptor,
+                            unfilteredDeploymentDescriptor,
                             StandardCopyOption.REPLACE_EXISTING,
                             StandardCopyOption.COPY_ATTRIBUTES);
                     mavenFileFilter.copyFile(
@@ -229,37 +211,38 @@ public class AcrMojo extends AbstractMojo {
                             deploymentDescriptor,
                             true,
                             filterWrappers,
-                            getEncoding(unfilteredDeploymentDescriptor.toPath()));
+                            getEncoding(unfilteredDeploymentDescriptor));
                     // Remove the temporary file
-                    Files.deleteIfExists(unfilteredDeploymentDescriptor.toPath());
+                    Files.deleteIfExists(unfilteredDeploymentDescriptor);
                 }
-                archiver.getArchiver().addFile(deploymentDescriptor, APP_CLIENT_XML);
+                archiver.getArchiver().addFile(deploymentDescriptor.toFile(), APP_CLIENT_XML);
             }
 
             // create archive
             archiver.createArchive(session, project, archive);
-        } catch (ArchiverException e) {
-            throw new MojoExecutionException(
+        } catch (ArchiverException | MavenArchiverException e) {
+            throw new MojoException(
                     "There was a problem creating the JavaEE Application Client archive: " + e.getMessage(), e);
-        } catch (ManifestException e) {
-            throw new MojoExecutionException(
-                    "There was a problem reading / creating the manifest for the JavaEE Application Client archive: "
-                            + e.getMessage(),
-                    e);
-        } catch (IOException e) {
-            throw new MojoExecutionException(
+        } catch (IOException | UncheckedIOException e) {
+            throw new MojoException(
                     "There was an I/O problem creating the JavaEE Application Client archive: " + e.getMessage(), e);
-        } catch (DependencyResolutionRequiredException e) {
-            throw new MojoExecutionException(
-                    "There was a problem resolving dependencies while creating the JavaEE Application Client archive: "
-                            + e.getMessage(),
-                    e);
         } catch (MavenFilteringException e) {
-            throw new MojoExecutionException(
-                    "There was a problem filtering the deployment descriptor: " + e.getMessage(), e);
+            throw new MojoException("There was a problem filtering the deployment descriptor: " + e.getMessage(), e);
         }
 
-        project.getArtifact().setFile(jarFile);
+        projectManager.attachArtifact(project, project.getMainArtifact().orElseThrow(), jarFile);
+    }
+
+    /**
+     * Returns the excludes for the main jar, leaving the configured list untouched.
+     */
+    static String[] mainJarExcludes(List<String> configured) {
+        if (configured == null || configured.isEmpty()) {
+            return DEFAULT_EXCLUDES.clone();
+        }
+        List<String> allExcludes = new ArrayList<>(configured);
+        allExcludes.add(APP_CLIENT_XML);
+        return allExcludes.toArray(new String[0]);
     }
 
     /**
